@@ -280,3 +280,111 @@ fn json_escape(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shipment(carrier: &str, l: f64, w: f64, h: f64, weight: f64) -> Shipment {
+        Shipment {
+            id: "T1".to_string(),
+            carrier: carrier.to_string(),
+            length_in: l,
+            width_in: w,
+            height_in: h,
+            weight_lb: weight,
+        }
+    }
+
+    #[test]
+    fn dim_weight_rounds_up_to_whole_pound() {
+        // 12*10*8 / 139 = 6.906..., should round up to 7, not truncate to 6.
+        let a = assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), None);
+        assert_eq!(a.dim_weight, 7.0);
+        assert_eq!(a.billed_weight, 7.0);
+        assert!(a.dim_applies);
+        assert_eq!(a.excess_lb, 2.0);
+    }
+
+    #[test]
+    fn actual_weight_rounds_up_before_comparison() {
+        // 9*6*4 / 166 = 1.301..., rounds up to 2. Actual 1.1 rounds up to 2 too,
+        // so DIM should not apply even though the raw dim figure exceeds raw weight.
+        let a = assess(shipment("usps", 9.0, 6.0, 4.0, 1.1), None);
+        assert_eq!(a.dim_weight, 2.0);
+        assert_eq!(a.billed_weight, 2.0);
+        assert!(!a.dim_applies);
+        assert_eq!(a.excess_lb, 0.0);
+    }
+
+    #[test]
+    fn equal_rounded_weights_do_not_flag_dim() {
+        // Exact tie after rounding: billed weight equals actual, not "billed on DIM".
+        let a = assess(shipment("fedex", 10.0, 10.0, 10.0, 7.2), None);
+        assert_eq!(a.dim_weight, 8.0);
+        assert_eq!(a.billed_weight, 8.0);
+        assert!(!a.dim_applies);
+    }
+
+    #[test]
+    fn dim_weight_never_rounds_below_one_pound() {
+        let a = assess(shipment("ups", 1.0, 1.0, 1.0, 0.1), None);
+        assert_eq!(a.dim_weight, 1.0);
+        assert_eq!(a.billed_weight, 1.0);
+    }
+
+    #[test]
+    fn divisor_override_beats_carrier_default() {
+        let a = assess(shipment("usps", 12.0, 10.0, 8.0, 4.2), Some(139.0));
+        assert_eq!(a.divisor, 139.0);
+        assert_eq!(a.dim_weight, 7.0);
+    }
+
+    #[test]
+    fn unknown_carrier_falls_back_to_139() {
+        assert_eq!(divisor_for_carrier("dhl"), 139.0);
+        assert_eq!(divisor_for_carrier("USPS"), 166.0);
+        assert_eq!(divisor_for_carrier("Ups"), 139.0);
+    }
+
+    #[test]
+    fn parse_positive_rejects_zero_and_negative() {
+        assert!(parse_positive("0", "weight_lb", 1).is_err());
+        assert!(parse_positive("-3", "weight_lb", 1).is_err());
+    }
+
+    #[test]
+    fn parse_positive_rejects_non_numeric() {
+        assert!(parse_positive("abc", "weight_lb", 1).is_err());
+    }
+
+    #[test]
+    fn parse_positive_accepts_fraction() {
+        assert_eq!(parse_positive("4.2", "weight_lb", 1).unwrap(), 4.2);
+    }
+
+    #[test]
+    fn parse_csv_skips_header_row() {
+        let shipments = parse_csv("id,carrier,length_in,width_in,height_in,weight_lb\nA1,ups,1,1,1,1\n").unwrap();
+        assert_eq!(shipments.len(), 1);
+        assert_eq!(shipments[0].id, "A1");
+    }
+
+    #[test]
+    fn parse_csv_without_header_keeps_first_row() {
+        let shipments = parse_csv("A1,ups,1,1,1,1\n").unwrap();
+        assert_eq!(shipments.len(), 1);
+    }
+
+    #[test]
+    fn parse_csv_skips_blank_lines() {
+        let shipments = parse_csv("A1,ups,1,1,1,1\n\nA2,fedex,2,2,2,2\n").unwrap();
+        assert_eq!(shipments.len(), 2);
+    }
+
+    #[test]
+    fn parse_csv_rejects_wrong_field_count() {
+        let err = parse_csv("A1,ups,1,1,1\n").unwrap_err();
+        assert!(err.contains("expected 6 fields"));
+    }
+}

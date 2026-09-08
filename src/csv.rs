@@ -27,3 +27,56 @@ pub fn parse_line(line: &str) -> Vec<String> {
     fields.push(current.trim().to_string());
     fields
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_plain_fields() {
+        assert_eq!(
+            parse_line("A1001,ups,12,10,8,4.2"),
+            vec!["A1001", "ups", "12", "10", "8", "4.2"]
+        );
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(parse_line(" a , b ,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn keeps_comma_inside_quotes() {
+        assert_eq!(
+            parse_line("\"Acme, Inc\",ups,12"),
+            vec!["Acme, Inc", "ups", "12"]
+        );
+    }
+
+    #[test]
+    fn unescapes_doubled_quotes() {
+        assert_eq!(parse_line("\"12\"\" box\",ups"), vec!["12\" box", "ups"]);
+    }
+
+    #[test]
+    fn handles_empty_fields() {
+        assert_eq!(parse_line("a,,c"), vec!["a", "", "c"]);
+    }
+
+    #[test]
+    fn handles_empty_line() {
+        assert_eq!(parse_line(""), vec![""]);
+    }
+
+    #[test]
+    fn quoted_field_can_be_empty() {
+        assert_eq!(parse_line("a,\"\",c"), vec!["a", "", "c"]);
+    }
+
+    #[test]
+    fn unterminated_quote_reads_rest_of_line() {
+        // No closing quote: everything after it stays part of the field
+        // instead of panicking or dropping data.
+        assert_eq!(parse_line("\"a,b,c"), vec!["a,b,c"]);
+    }
+}

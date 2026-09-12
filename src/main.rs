@@ -8,6 +8,7 @@ struct Options {
     path: String,
     json: bool,
     divisor_override: Option<f64>,
+    sort_by_excess: bool,
 }
 
 struct Shipment {
@@ -60,10 +61,14 @@ fn main() {
         process::exit(1);
     }
 
-    let assessments: Vec<Assessment> = shipments
+    let mut assessments: Vec<Assessment> = shipments
         .into_iter()
         .map(|s| assess(s, opts.divisor_override))
         .collect();
+
+    if opts.sort_by_excess {
+        assessments.sort_by(|a, b| b.excess_lb.partial_cmp(&a.excess_lb).unwrap());
+    }
 
     if opts.json {
         print_json(&assessments);
@@ -76,11 +81,13 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut path = None;
     let mut json = false;
     let mut divisor_override = None;
+    let mut sort_by_excess = false;
     let mut iter = args.into_iter().skip(1);
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => json = true,
+            "--sort" => sort_by_excess = true,
             "--divisor" => {
                 let value = iter.next().ok_or("--divisor requires a value")?;
                 let parsed: f64 = value
@@ -105,15 +112,17 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         path,
         json,
         divisor_override,
+        sort_by_excess,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N]");
+    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N] [--sort]");
     eprintln!();
     eprintln!("  shipments.csv   columns: id,carrier,length_in,width_in,height_in,weight_lb");
     eprintln!("  --json          emit machine-readable JSON instead of a table");
     eprintln!("  --divisor N     override the DIM divisor for every row (default depends on carrier)");
+    eprintln!("  --sort          sort output by excess weight, highest first");
 }
 
 fn parse_csv(contents: &str) -> Result<Vec<Shipment>, String> {
@@ -386,5 +395,34 @@ mod tests {
     fn parse_csv_rejects_wrong_field_count() {
         let err = parse_csv("A1,ups,1,1,1\n").unwrap_err();
         assert!(err.contains("expected 6 fields"));
+    }
+
+    #[test]
+    fn parse_args_defaults_sort_to_false() {
+        let opts = parse_args(vec!["dimaudit".to_string(), "shipments.csv".to_string()]).unwrap();
+        assert!(!opts.sort_by_excess);
+    }
+
+    #[test]
+    fn parse_args_recognizes_sort_flag() {
+        let opts = parse_args(vec![
+            "dimaudit".to_string(),
+            "shipments.csv".to_string(),
+            "--sort".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.sort_by_excess);
+    }
+
+    #[test]
+    fn sort_by_excess_orders_highest_first() {
+        let mut assessments = vec![
+            assess(shipment("ups", 10.0, 10.0, 10.0, 7.2), None), // excess 0.0
+            assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), None),  // excess 2.0
+            assess(shipment("fedex", 20.0, 14.0, 10.0, 6.0), None), // excess 9.0
+        ];
+        assessments.sort_by(|a, b| b.excess_lb.partial_cmp(&a.excess_lb).unwrap());
+        let excess: Vec<f64> = assessments.iter().map(|a| a.excess_lb).collect();
+        assert_eq!(excess, vec![9.0, 2.0, 0.0]);
     }
 }

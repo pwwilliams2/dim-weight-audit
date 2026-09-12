@@ -70,6 +70,13 @@ non-standard one) with `--divisor`:
 cargo run -- shipments.csv --divisor 166
 ```
 
+To see the worst offenders first, sort by excess weight with `--sort`
+(highest excess first, works with both table and `--json` output):
+
+```
+cargo run -- shipments.csv --sort
+```
+
 ## Why the defaults might be wrong for you
 
 139 and 166 are the commonly published divisors, but actual contracts vary,

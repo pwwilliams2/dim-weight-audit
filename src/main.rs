@@ -191,13 +191,32 @@ fn divisor_for_carrier(carrier: &str) -> f64 {
     }
 }
 
+// UPS and FedEx only bill DIM weight on packages at or above one cubic foot
+// (1,728 in^3) - anything smaller ships at actual weight no matter how it's
+// shaped. USPS Priority Mail has no such floor: its cubic pricing can kick
+// in on small, dense packages too. Unlisted carriers get the same 1,728 in^3
+// floor as UPS/FedEx, matching the divisor default above.
+fn dim_threshold_in3_for_carrier(carrier: &str) -> f64 {
+    match carrier.to_lowercase().as_str() {
+        "usps" => 0.0,
+        _ => 1728.0,
+    }
+}
+
 fn assess(shipment: Shipment, override_divisor: Option<f64>) -> Assessment {
     let divisor = override_divisor.unwrap_or_else(|| divisor_for_carrier(&shipment.carrier));
-    let raw_dim_weight = (shipment.length_in * shipment.width_in * shipment.height_in) / divisor;
+    let volume_in3 = shipment.length_in * shipment.width_in * shipment.height_in;
+    let raw_dim_weight = volume_in3 / divisor;
     let dim_weight = raw_dim_weight.ceil().max(1.0);
     let actual_rounded = shipment.weight_lb.ceil().max(1.0);
-    let billed_weight = dim_weight.max(actual_rounded);
-    let dim_applies = dim_weight > actual_rounded;
+
+    let threshold = dim_threshold_in3_for_carrier(&shipment.carrier);
+    let (billed_weight, dim_applies) = if volume_in3 < threshold {
+        (actual_rounded, false)
+    } else {
+        let billed_weight = dim_weight.max(actual_rounded);
+        (billed_weight, dim_weight > actual_rounded)
+    };
     let excess_lb = billed_weight - actual_rounded;
 
     Assessment {
@@ -307,12 +326,13 @@ mod tests {
 
     #[test]
     fn dim_weight_rounds_up_to_whole_pound() {
-        // 12*10*8 / 139 = 6.906..., should round up to 7, not truncate to 6.
-        let a = assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), None);
-        assert_eq!(a.dim_weight, 7.0);
-        assert_eq!(a.billed_weight, 7.0);
+        // 16*12*10 / 139 = 13.81..., should round up to 14, not truncate to 13.
+        // Volume is 1920 in^3, clear of the 1728 in^3 threshold, so it applies.
+        let a = assess(shipment("fedex", 16.0, 12.0, 10.0, 4.2), None);
+        assert_eq!(a.dim_weight, 14.0);
+        assert_eq!(a.billed_weight, 14.0);
         assert!(a.dim_applies);
-        assert_eq!(a.excess_lb, 2.0);
+        assert_eq!(a.excess_lb, 9.0);
     }
 
     #[test]
@@ -329,9 +349,10 @@ mod tests {
     #[test]
     fn equal_rounded_weights_do_not_flag_dim() {
         // Exact tie after rounding: billed weight equals actual, not "billed on DIM".
-        let a = assess(shipment("fedex", 10.0, 10.0, 10.0, 7.2), None);
-        assert_eq!(a.dim_weight, 8.0);
-        assert_eq!(a.billed_weight, 8.0);
+        // 1728 in^3 sits right at the fedex threshold, so DIM pricing still applies.
+        let a = assess(shipment("fedex", 12.0, 12.0, 12.0, 12.1), None);
+        assert_eq!(a.dim_weight, 13.0);
+        assert_eq!(a.billed_weight, 13.0);
         assert!(!a.dim_applies);
     }
 
@@ -340,6 +361,35 @@ mod tests {
         let a = assess(shipment("ups", 1.0, 1.0, 1.0, 0.1), None);
         assert_eq!(a.dim_weight, 1.0);
         assert_eq!(a.billed_weight, 1.0);
+    }
+
+    #[test]
+    fn small_package_under_threshold_ships_at_actual_weight() {
+        // 10*8*6 = 480 in^3, well under the 1728 in^3 UPS/FedEx floor, even
+        // though the raw dim weight (3 lb) would exceed the actual weight (1 lb).
+        let a = assess(shipment("ups", 10.0, 8.0, 6.0, 0.3), None);
+        assert_eq!(a.dim_weight, 3.0);
+        assert_eq!(a.billed_weight, 1.0);
+        assert!(!a.dim_applies);
+        assert_eq!(a.excess_lb, 0.0);
+    }
+
+    #[test]
+    fn usps_has_no_size_threshold() {
+        // Same box as small_package_under_threshold_ships_at_actual_weight, but
+        // USPS has no minimum size, so DIM pricing still applies.
+        let a = assess(shipment("usps", 10.0, 8.0, 6.0, 0.3), None);
+        assert_eq!(a.dim_weight, 3.0);
+        assert_eq!(a.billed_weight, 3.0);
+        assert!(a.dim_applies);
+        assert_eq!(a.excess_lb, 2.0);
+    }
+
+    #[test]
+    fn volume_at_exact_threshold_still_applies() {
+        // 1728 in^3 is "at or above" the floor, not below it.
+        let a = assess(shipment("ups", 12.0, 12.0, 12.0, 1.0), None);
+        assert!(a.dim_applies);
     }
 
     #[test]
@@ -354,6 +404,13 @@ mod tests {
         assert_eq!(divisor_for_carrier("dhl"), 139.0);
         assert_eq!(divisor_for_carrier("USPS"), 166.0);
         assert_eq!(divisor_for_carrier("Ups"), 139.0);
+    }
+
+    #[test]
+    fn unknown_carrier_falls_back_to_1728_threshold() {
+        assert_eq!(dim_threshold_in3_for_carrier("dhl"), 1728.0);
+        assert_eq!(dim_threshold_in3_for_carrier("USPS"), 0.0);
+        assert_eq!(dim_threshold_in3_for_carrier("Fedex"), 1728.0);
     }
 
     #[test]
@@ -417,12 +474,12 @@ mod tests {
     #[test]
     fn sort_by_excess_orders_highest_first() {
         let mut assessments = vec![
-            assess(shipment("ups", 10.0, 10.0, 10.0, 7.2), None), // excess 0.0
-            assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), None),  // excess 2.0
-            assess(shipment("fedex", 20.0, 14.0, 10.0, 6.0), None), // excess 9.0
+            assess(shipment("fedex", 16.0, 12.0, 10.0, 5.0), None), // excess 9.0
+            assess(shipment("usps", 10.0, 8.0, 6.0, 2.0), None),    // excess 1.0
+            assess(shipment("fedex", 20.0, 14.0, 10.0, 6.0), None), // excess 15.0
         ];
         assessments.sort_by(|a, b| b.excess_lb.partial_cmp(&a.excess_lb).unwrap());
         let excess: Vec<f64> = assessments.iter().map(|a| a.excess_lb).collect();
-        assert_eq!(excess, vec![9.0, 2.0, 0.0]);
+        assert_eq!(excess, vec![15.0, 9.0, 1.0]);
     }
 }

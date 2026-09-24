@@ -1,5 +1,7 @@
+mod config;
 mod csv;
 
+use config::CarrierConfig;
 use std::env;
 use std::fs;
 use std::process;
@@ -9,6 +11,7 @@ struct Options {
     json: bool,
     divisor_override: Option<f64>,
     sort_by_excess: bool,
+    config_path: Option<String>,
 }
 
 struct Shipment {
@@ -61,9 +64,29 @@ fn main() {
         process::exit(1);
     }
 
+    let carrier_config = match &opts.config_path {
+        Some(path) => {
+            let contents = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: could not read config {}: {}", path, e);
+                    process::exit(1);
+                }
+            };
+            match config::parse(&contents) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
     let mut assessments: Vec<Assessment> = shipments
         .into_iter()
-        .map(|s| assess(s, opts.divisor_override))
+        .map(|s| assess(s, opts.divisor_override, carrier_config.as_ref()))
         .collect();
 
     if opts.sort_by_excess {
@@ -82,6 +105,7 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut json = false;
     let mut divisor_override = None;
     let mut sort_by_excess = false;
+    let mut config_path = None;
     let mut iter = args.into_iter().skip(1);
 
     while let Some(arg) = iter.next() {
@@ -98,6 +122,10 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
                 }
                 divisor_override = Some(parsed);
             }
+            "--config" => {
+                let value = iter.next().ok_or("--config requires a value")?;
+                config_path = Some(value);
+            }
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -113,15 +141,17 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         json,
         divisor_override,
         sort_by_excess,
+        config_path,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N] [--sort]");
+    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N] [--config FILE] [--sort]");
     eprintln!();
     eprintln!("  shipments.csv   columns: id,carrier,length_in,width_in,height_in,weight_lb");
     eprintln!("  --json          emit machine-readable JSON instead of a table");
     eprintln!("  --divisor N     override the DIM divisor for every row (default depends on carrier)");
+    eprintln!("  --config FILE   load per-carrier divisor/threshold overrides, columns: carrier,divisor,threshold_in3");
     eprintln!("  --sort          sort output by excess weight, highest first");
 }
 
@@ -203,14 +233,22 @@ fn dim_threshold_in3_for_carrier(carrier: &str) -> f64 {
     }
 }
 
-fn assess(shipment: Shipment, override_divisor: Option<f64>) -> Assessment {
-    let divisor = override_divisor.unwrap_or_else(|| divisor_for_carrier(&shipment.carrier));
+fn assess(
+    shipment: Shipment,
+    override_divisor: Option<f64>,
+    config: Option<&CarrierConfig>,
+) -> Assessment {
+    let divisor = override_divisor
+        .or_else(|| config.and_then(|c| c.divisor(&shipment.carrier)))
+        .unwrap_or_else(|| divisor_for_carrier(&shipment.carrier));
     let volume_in3 = shipment.length_in * shipment.width_in * shipment.height_in;
     let raw_dim_weight = volume_in3 / divisor;
     let dim_weight = raw_dim_weight.ceil().max(1.0);
     let actual_rounded = shipment.weight_lb.ceil().max(1.0);
 
-    let threshold = dim_threshold_in3_for_carrier(&shipment.carrier);
+    let threshold = config
+        .and_then(|c| c.threshold(&shipment.carrier))
+        .unwrap_or_else(|| dim_threshold_in3_for_carrier(&shipment.carrier));
     let (billed_weight, dim_applies) = if volume_in3 < threshold {
         (actual_rounded, false)
     } else {
@@ -328,7 +366,7 @@ mod tests {
     fn dim_weight_rounds_up_to_whole_pound() {
         // 16*12*10 / 139 = 13.81..., should round up to 14, not truncate to 13.
         // Volume is 1920 in^3, clear of the 1728 in^3 threshold, so it applies.
-        let a = assess(shipment("fedex", 16.0, 12.0, 10.0, 4.2), None);
+        let a = assess(shipment("fedex", 16.0, 12.0, 10.0, 4.2), None, None);
         assert_eq!(a.dim_weight, 14.0);
         assert_eq!(a.billed_weight, 14.0);
         assert!(a.dim_applies);
@@ -339,7 +377,7 @@ mod tests {
     fn actual_weight_rounds_up_before_comparison() {
         // 9*6*4 / 166 = 1.301..., rounds up to 2. Actual 1.1 rounds up to 2 too,
         // so DIM should not apply even though the raw dim figure exceeds raw weight.
-        let a = assess(shipment("usps", 9.0, 6.0, 4.0, 1.1), None);
+        let a = assess(shipment("usps", 9.0, 6.0, 4.0, 1.1), None, None);
         assert_eq!(a.dim_weight, 2.0);
         assert_eq!(a.billed_weight, 2.0);
         assert!(!a.dim_applies);
@@ -350,7 +388,7 @@ mod tests {
     fn equal_rounded_weights_do_not_flag_dim() {
         // Exact tie after rounding: billed weight equals actual, not "billed on DIM".
         // 1728 in^3 sits right at the fedex threshold, so DIM pricing still applies.
-        let a = assess(shipment("fedex", 12.0, 12.0, 12.0, 12.1), None);
+        let a = assess(shipment("fedex", 12.0, 12.0, 12.0, 12.1), None, None);
         assert_eq!(a.dim_weight, 13.0);
         assert_eq!(a.billed_weight, 13.0);
         assert!(!a.dim_applies);
@@ -358,7 +396,7 @@ mod tests {
 
     #[test]
     fn dim_weight_never_rounds_below_one_pound() {
-        let a = assess(shipment("ups", 1.0, 1.0, 1.0, 0.1), None);
+        let a = assess(shipment("ups", 1.0, 1.0, 1.0, 0.1), None, None);
         assert_eq!(a.dim_weight, 1.0);
         assert_eq!(a.billed_weight, 1.0);
     }
@@ -367,7 +405,7 @@ mod tests {
     fn small_package_under_threshold_ships_at_actual_weight() {
         // 10*8*6 = 480 in^3, well under the 1728 in^3 UPS/FedEx floor, even
         // though the raw dim weight (3 lb) would exceed the actual weight (1 lb).
-        let a = assess(shipment("ups", 10.0, 8.0, 6.0, 0.3), None);
+        let a = assess(shipment("ups", 10.0, 8.0, 6.0, 0.3), None, None);
         assert_eq!(a.dim_weight, 3.0);
         assert_eq!(a.billed_weight, 1.0);
         assert!(!a.dim_applies);
@@ -378,7 +416,7 @@ mod tests {
     fn usps_has_no_size_threshold() {
         // Same box as small_package_under_threshold_ships_at_actual_weight, but
         // USPS has no minimum size, so DIM pricing still applies.
-        let a = assess(shipment("usps", 10.0, 8.0, 6.0, 0.3), None);
+        let a = assess(shipment("usps", 10.0, 8.0, 6.0, 0.3), None, None);
         assert_eq!(a.dim_weight, 3.0);
         assert_eq!(a.billed_weight, 3.0);
         assert!(a.dim_applies);
@@ -388,15 +426,45 @@ mod tests {
     #[test]
     fn volume_at_exact_threshold_still_applies() {
         // 1728 in^3 is "at or above" the floor, not below it.
-        let a = assess(shipment("ups", 12.0, 12.0, 12.0, 1.0), None);
+        let a = assess(shipment("ups", 12.0, 12.0, 12.0, 1.0), None, None);
         assert!(a.dim_applies);
     }
 
     #[test]
     fn divisor_override_beats_carrier_default() {
-        let a = assess(shipment("usps", 12.0, 10.0, 8.0, 4.2), Some(139.0));
+        let a = assess(shipment("usps", 12.0, 10.0, 8.0, 4.2), Some(139.0), None);
         assert_eq!(a.divisor, 139.0);
         assert_eq!(a.dim_weight, 7.0);
+    }
+
+    #[test]
+    fn config_divisor_beats_carrier_default() {
+        let cfg = config::parse("ups,150,1728\n").unwrap();
+        let a = assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), None, Some(&cfg));
+        assert_eq!(a.divisor, 150.0);
+    }
+
+    #[test]
+    fn explicit_divisor_flag_beats_config() {
+        let cfg = config::parse("ups,150,1728\n").unwrap();
+        let a = assess(shipment("ups", 12.0, 10.0, 8.0, 4.2), Some(139.0), Some(&cfg));
+        assert_eq!(a.divisor, 139.0);
+    }
+
+    #[test]
+    fn config_threshold_beats_carrier_default() {
+        // 10*8*6 = 480 in^3, under the built-in 1728 in^3 UPS floor, but the
+        // config lowers the floor to 400 in^3 so DIM pricing applies here.
+        let cfg = config::parse("ups,139,400\n").unwrap();
+        let a = assess(shipment("ups", 10.0, 8.0, 6.0, 0.3), None, Some(&cfg));
+        assert!(a.dim_applies);
+    }
+
+    #[test]
+    fn carrier_without_config_entry_uses_defaults() {
+        let cfg = config::parse("ups,150,1728\n").unwrap();
+        let a = assess(shipment("fedex", 16.0, 12.0, 10.0, 4.2), None, Some(&cfg));
+        assert_eq!(a.divisor, 139.0);
     }
 
     #[test]
@@ -474,12 +542,35 @@ mod tests {
     #[test]
     fn sort_by_excess_orders_highest_first() {
         let mut assessments = vec![
-            assess(shipment("fedex", 16.0, 12.0, 10.0, 5.0), None), // excess 9.0
-            assess(shipment("usps", 10.0, 8.0, 6.0, 2.0), None),    // excess 1.0
-            assess(shipment("fedex", 20.0, 14.0, 10.0, 6.0), None), // excess 15.0
+            assess(shipment("fedex", 16.0, 12.0, 10.0, 5.0), None, None), // excess 9.0
+            assess(shipment("usps", 10.0, 8.0, 6.0, 2.0), None, None),    // excess 1.0
+            assess(shipment("fedex", 20.0, 14.0, 10.0, 6.0), None, None), // excess 15.0
         ];
         assessments.sort_by(|a, b| b.excess_lb.partial_cmp(&a.excess_lb).unwrap());
         let excess: Vec<f64> = assessments.iter().map(|a| a.excess_lb).collect();
         assert_eq!(excess, vec![15.0, 9.0, 1.0]);
+    }
+
+    #[test]
+    fn parse_args_recognizes_config_flag() {
+        let opts = parse_args(vec![
+            "dimaudit".to_string(),
+            "shipments.csv".to_string(),
+            "--config".to_string(),
+            "carriers.csv".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.config_path, Some("carriers.csv".to_string()));
+    }
+
+    #[test]
+    fn parse_args_config_requires_value() {
+        let err = parse_args(vec![
+            "dimaudit".to_string(),
+            "shipments.csv".to_string(),
+            "--config".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("--config requires a value"));
     }
 }

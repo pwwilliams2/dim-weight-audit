@@ -94,6 +94,28 @@ contracts vary, and some carriers apply DIM pricing only to certain service
 levels or destination zones on top of the size cutoff. Treat the output as a
 flag for "go check this shipment," not as your actual invoice amount.
 
+If you have negotiated rates, put the real numbers in a config file instead
+of overriding one carrier at a time. `--config` takes a CSV with a header row
+(optional) and these columns:
+
+```
+carrier,divisor,threshold_in3
+ups,139,2000
+fedex,139,1728
+usps,166,0
+```
+
+Carrier names are matched case-insensitively. Any carrier not listed in the
+config file keeps the built-in default divisor and threshold. Lines starting
+with `#` and blank lines are skipped.
+
+```
+cargo run -- shipments.csv --config carriers.csv
+```
+
+`--divisor` still takes priority over the config file when both are given -
+it's for a one-off run, the config file is for your standing rates.
+
 ## Building
 
 Standard library only, no dependencies to fetch:

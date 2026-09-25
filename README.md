@@ -86,6 +86,24 @@ To see the worst offenders first, sort by excess weight with `--sort`
 cargo run -- shipments.csv --sort
 ```
 
+To cut the noise and see only the shipments actually billed on dimensional
+weight, add `--filter`. It narrows the row list in both table and `--json`
+output; the summary line still reports totals across every shipment in the
+file, so you can tell how much was filtered out:
+
+```
+cargo run -- shipments.csv --filter
+```
+
+```
+ID         CARRIER  ACTUAL_LB   DIM_LB  BILLED_LB  DIM?   EXCESS
+A1002      fedex          6.0     21.0       21.0   yes     15.0
+
+shipments shown: 1 (of 3 checked)
+billed on dimensional weight: 1 (33%)
+total excess billed weight: 15.0 lb
+```
+
 ## Why the defaults might be wrong for you
 
 139 and 166 are the commonly published divisors, and 1,728 in³ is the

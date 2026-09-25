@@ -12,6 +12,7 @@ struct Options {
     divisor_override: Option<f64>,
     sort_by_excess: bool,
     config_path: Option<String>,
+    filter_dim_applies: bool,
 }
 
 struct Shipment {
@@ -93,10 +94,16 @@ fn main() {
         assessments.sort_by(|a, b| b.excess_lb.partial_cmp(&a.excess_lb).unwrap());
     }
 
-    if opts.json {
-        print_json(&assessments);
+    let rows: Vec<&Assessment> = if opts.filter_dim_applies {
+        assessments.iter().filter(|a| a.dim_applies).collect()
     } else {
-        print_table(&assessments);
+        assessments.iter().collect()
+    };
+
+    if opts.json {
+        print_json(&rows, &assessments);
+    } else {
+        print_table(&rows, &assessments);
     }
 }
 
@@ -106,12 +113,14 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
     let mut divisor_override = None;
     let mut sort_by_excess = false;
     let mut config_path = None;
+    let mut filter_dim_applies = false;
     let mut iter = args.into_iter().skip(1);
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => json = true,
             "--sort" => sort_by_excess = true,
+            "--filter" => filter_dim_applies = true,
             "--divisor" => {
                 let value = iter.next().ok_or("--divisor requires a value")?;
                 let parsed: f64 = value
@@ -142,17 +151,19 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
         divisor_override,
         sort_by_excess,
         config_path,
+        filter_dim_applies,
     })
 }
 
 fn print_usage() {
-    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N] [--config FILE] [--sort]");
+    eprintln!("usage: dimaudit <shipments.csv> [--json] [--divisor N] [--config FILE] [--sort] [--filter]");
     eprintln!();
     eprintln!("  shipments.csv   columns: id,carrier,length_in,width_in,height_in,weight_lb");
     eprintln!("  --json          emit machine-readable JSON instead of a table");
     eprintln!("  --divisor N     override the DIM divisor for every row (default depends on carrier)");
     eprintln!("  --config FILE   load per-carrier divisor/threshold overrides, columns: carrier,divisor,threshold_in3");
     eprintln!("  --sort          sort output by excess weight, highest first");
+    eprintln!("  --filter        show only shipments billed on dimensional weight (summary still covers all rows)");
 }
 
 fn parse_csv(contents: &str) -> Result<Vec<Shipment>, String> {
@@ -267,12 +278,15 @@ fn assess(
     }
 }
 
-fn print_table(assessments: &[Assessment]) {
+// `rows` is what gets printed (may be narrowed by --filter); `all` is always
+// the full assessed set, so the summary counts stay meaningful even when the
+// row list has been filtered down to a subset.
+fn print_table(rows: &[&Assessment], all: &[Assessment]) {
     println!(
         "{:<10} {:<8} {:>10} {:>8} {:>10} {:>5} {:>8}",
         "ID", "CARRIER", "ACTUAL_LB", "DIM_LB", "BILLED_LB", "DIM?", "EXCESS"
     );
-    for a in assessments {
+    for a in rows {
         println!(
             "{:<10} {:<8} {:>10.1} {:>8.1} {:>10.1} {:>5} {:>8.1}",
             a.shipment.id,
@@ -285,12 +299,16 @@ fn print_table(assessments: &[Assessment]) {
         );
     }
 
-    let total = assessments.len();
-    let flagged = assessments.iter().filter(|a| a.dim_applies).count();
-    let total_excess: f64 = assessments.iter().map(|a| a.excess_lb).sum();
+    let total = all.len();
+    let flagged = all.iter().filter(|a| a.dim_applies).count();
+    let total_excess: f64 = all.iter().map(|a| a.excess_lb).sum();
 
     println!();
-    println!("shipments checked: {}", total);
+    if rows.len() != total {
+        println!("shipments shown: {} (of {} checked)", rows.len(), total);
+    } else {
+        println!("shipments checked: {}", total);
+    }
     println!(
         "billed on dimensional weight: {} ({:.0}%)",
         flagged,
@@ -299,10 +317,10 @@ fn print_table(assessments: &[Assessment]) {
     println!("total excess billed weight: {:.1} lb", total_excess);
 }
 
-fn print_json(assessments: &[Assessment]) {
+fn print_json(rows: &[&Assessment], all: &[Assessment]) {
     let mut out = String::from("{\n  \"shipments\": [\n");
 
-    for (i, a) in assessments.iter().enumerate() {
+    for (i, a) in rows.iter().enumerate() {
         out.push_str(&format!(
             "    {{\"id\": \"{}\", \"carrier\": \"{}\", \"actual_lb\": {:.1}, \"dim_lb\": {:.1}, \"billed_lb\": {:.1}, \"dim_applies\": {}, \"excess_lb\": {:.1}, \"divisor\": {:.0}}}",
             json_escape(&a.shipment.id),
@@ -314,16 +332,16 @@ fn print_json(assessments: &[Assessment]) {
             a.excess_lb,
             a.divisor
         ));
-        if i + 1 < assessments.len() {
+        if i + 1 < rows.len() {
             out.push(',');
         }
         out.push('\n');
     }
     out.push_str("  ],\n");
 
-    let total = assessments.len();
-    let flagged = assessments.iter().filter(|a| a.dim_applies).count();
-    let total_excess: f64 = assessments.iter().map(|a| a.excess_lb).sum();
+    let total = all.len();
+    let flagged = all.iter().filter(|a| a.dim_applies).count();
+    let total_excess: f64 = all.iter().map(|a| a.excess_lb).sum();
 
     out.push_str(&format!(
         "  \"summary\": {{\"shipments\": {}, \"dim_billed\": {}, \"total_excess_lb\": {:.1}}}\n",
@@ -561,6 +579,23 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(opts.config_path, Some("carriers.csv".to_string()));
+    }
+
+    #[test]
+    fn parse_args_defaults_filter_to_false() {
+        let opts = parse_args(vec!["dimaudit".to_string(), "shipments.csv".to_string()]).unwrap();
+        assert!(!opts.filter_dim_applies);
+    }
+
+    #[test]
+    fn parse_args_recognizes_filter_flag() {
+        let opts = parse_args(vec![
+            "dimaudit".to_string(),
+            "shipments.csv".to_string(),
+            "--filter".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.filter_dim_applies);
     }
 
     #[test]
